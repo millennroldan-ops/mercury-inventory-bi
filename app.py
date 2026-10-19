@@ -268,9 +268,14 @@ st.markdown("""
 <style>
 [data-testid="stSidebar"] {
     background-color: #fff7f8;
+    color: #111111;
+}
+/* This ensures all text, labels, and radio button options inside the sidebar are dark and visible */
+[data-testid="stSidebar"] * {
+    color: #111111 !important;
 }
 div[data-testid="stMetric"] {
-    background: white;
+    background-color: white;
     border: 1px solid #f0d5da;
     padding: 14px;
     border-radius: 10px;
@@ -287,7 +292,6 @@ div.stButton > button:hover {
 }
 </style>
 """, unsafe_allow_html=True)
-
 products = read_products()
 sales = read_sales()
 report = analyze(products, sales)
