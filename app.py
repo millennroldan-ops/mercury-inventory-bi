@@ -16,6 +16,38 @@ st.set_page_config(
     layout="wide"
 )
 
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+if not st.session_state["authenticated"]:
+    st.markdown("""
+    <div style="background:#c8102e;color:white;padding:25px;
+                border-radius:12px;text-align:center">
+        <h1 style="color:white">💊 Inventory BI System</h1>
+        <p>Predictive Supply Chain & Inventory Optimization</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in")
+
+    if submitted:
+        try:
+            valid_user = st.secrets["login"]["username"]
+            valid_password = st.secrets["login"]["password"]
+
+            if username == valid_user and password == valid_password:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+        except (KeyError, FileNotFoundError):
+            st.error("Configure your login credentials in secrets.toml.")
+
+    st.stop()
+
 
 def connect():
     return sqlite3.connect(DB)
@@ -203,11 +235,58 @@ st.caption(
     "Catbalogan City Proper"
 )
 
-st.info(
-    "ACADEMIC PROTOTYPE: all initial sales and inventory "
-    "records are synthetic. This application is not affiliated "
-    "with or connected to the actual Mercury Drug company."
+
+st.markdown("""
+<div style="
+    background: linear-gradient(115deg, #b5122b, #e51b35);
+    padding: 28px;
+    border-radius: 14px;
+    color: white;
+    margin-bottom: 18px;
+">
+    <div style="font-size:13px;letter-spacing:2px;">
+        INVENTORY • ANALYTICS • FORECASTING
+    </div>
+    <h1 style="color:white;margin:10px 0;">
+        💊 Mercury Drugs Inventory BI
+    </h1>
+    <p style="margin:0;">
+        Predictive Supply Chain & Inventory Optimization
+    </p>
+    <p style="font-size:12px;margin-top:12px;">
+        Academic Prototype • Synthetic Demonstration Data
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+st.caption(
+    "Student project only. Not affiliated with or connected "
+    "to the actual Mercury Drug company."
 )
+
+st.markdown("""
+<style>
+[data-testid="stSidebar"] {
+    background-color: #fff7f8;
+}
+div[data-testid="stMetric"] {
+    background: white;
+    border: 1px solid #f0d5da;
+    padding: 14px;
+    border-radius: 10px;
+}
+div.stButton > button {
+    background-color: #c8102e;
+    color: white;
+    border-radius: 8px;
+    border: none;
+}
+div.stButton > button:hover {
+    background-color: #a50d24;
+    color: white;
+}
+</style>
+""", unsafe_allow_html=True)
 
 products = read_products()
 sales = read_sales()
@@ -223,7 +302,43 @@ page = st.sidebar.radio("Navigation", [
     "Export Reports"
 ])
 
+st.sidebar.divider()
+st.sidebar.caption("Signed in as admin")
+
+if st.sidebar.button("🚪 Log out", use_container_width=True):
+    st.session_state["authenticated"] = False
+    st.rerun()
+
 if page == "Dashboard":
+    st.markdown("""
+    <div style="
+        background:white;
+        border:1px solid #eadde0;
+        border-left:6px solid #c8102e;
+        padding:18px;
+        border-radius:10px;
+        margin-bottom:20px;
+    ">
+        <div style="color:#b5122b;font-size:18px;
+                    font-weight:bold;">
+            📍 Store Location
+        </div>
+        <div style="color:#333;margin-top:10px;">
+            QVGM+G73, Allen Avenue, Catbalogan City Proper,
+            City of Catbalogan, 6700 Samar
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.link_button(
+        "📍 Open in Google Maps",
+        "https://www.google.com/maps/search/?api=1&query=QVGM%2BG73%2C%20Allen%20Avenue%2C%20Catbalogan%20City%20Proper%2C%20City%20of%20Catbalogan%2C%206700%20Samar"
+    )
+
+    st.write("")
+    a, b, c, d = st.columns(4)
+
+   
     a, b, c, d = st.columns(4)
 
     a.metric("Products", len(products))
