@@ -1,4 +1,3 @@
-
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
@@ -8,6 +7,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from streamlit_cookies_controller import CookieController
+
 DB = Path(__file__).parent / "inventory.db"
 
 st.set_page_config(
@@ -15,6 +16,12 @@ st.set_page_config(
     page_icon="📦",
     layout="wide"
 )
+
+cookies = CookieController()
+
+saved_token = cookies.get("mercury_auth")
+if saved_token == "authenticated" and "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = True
 
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
@@ -40,6 +47,9 @@ if not st.session_state["authenticated"]:
 
             if username == valid_user and password == valid_password:
                 st.session_state["authenticated"] = True
+
+                cookies.set("mercury_auth", "authenticated")
+
                 st.rerun()
             else:
                 st.error("Invalid username or password.")
@@ -171,8 +181,8 @@ def analyze(products, sales):
 
         if len(previous) > 0:
             avg_day = (
-                0.65 * recent.mean()
-                + 0.35 * previous.mean()
+                    0.65 * recent.mean()
+                    + 0.35 * previous.mean()
             )
         else:
             avg_day = recent.mean()
@@ -235,7 +245,6 @@ st.caption(
     "Catbalogan City Proper"
 )
 
-
 st.markdown("""
 <div style="
     background: linear-gradient(115deg, #b5122b, #e51b35);
@@ -292,6 +301,7 @@ div.stButton > button:hover {
 }
 </style>
 """, unsafe_allow_html=True)
+
 products = read_products()
 sales = read_sales()
 report = analyze(products, sales)
@@ -310,6 +320,7 @@ st.sidebar.divider()
 st.sidebar.caption("Signed in as admin")
 
 if st.sidebar.button("🚪 Log out", use_container_width=True):
+    cookies.remove("mercury_auth")
     st.session_state["authenticated"] = False
     st.rerun()
 
@@ -342,7 +353,6 @@ if page == "Dashboard":
     st.write("")
     a, b, c, d = st.columns(4)
 
-   
     a, b, c, d = st.columns(4)
 
     a.metric("Products", len(products))
@@ -580,9 +590,4 @@ elif page == "Export Reports":
         "delivery_history.csv",
         "text/csv"
     )
-
-st.divider()
-st.caption(
-    "BI prototype • Synthetic demonstration data • "
-    "Forecasts require validation before real purchasing decisions."
 )
