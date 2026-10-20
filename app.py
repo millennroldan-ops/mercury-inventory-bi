@@ -19,9 +19,6 @@ st.set_page_config(
 
 cookies = CookieController()
 
-if not cookies.ready():
-    st.stop()
-
 saved_token = cookies.get("mercury_auth")
 
 if "authenticated" not in st.session_state:
