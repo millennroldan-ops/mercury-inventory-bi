@@ -19,9 +19,12 @@ st.set_page_config(
 
 cookies = CookieController()
 
-saved_token = cookies.get("mercury_auth")
-if saved_token == "authenticated" and "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = True
+try:
+    saved_token = cookies.get("mercury_auth")
+    if saved_token == "authenticated" and "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = True
+except Exception:
+    pass
 
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
@@ -104,6 +107,16 @@ def initialize():
         )
         """)
 
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS writeoffs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            writeoff_date TEXT NOT NULL,
+            sku TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            reason TEXT NOT NULL
+        )
+        """)
+
         count = con.execute("SELECT COUNT(*) FROM products").fetchone()[0]
 
         if count == 0:
@@ -160,8 +173,35 @@ def read_sales():
         con.close()
 
 
-def analyze(products, sales):
+@st.cache_data
+def read_deliveries():
+    con = sqlite3.connect(DB)
+    try:
+        return pd.read_sql_query("SELECT * FROM deliveries ORDER BY delivery_date DESC", con)
+    finally:
+        con.close()
+
+
+@st.cache_data
+def read_writeoffs():
+    con = sqlite3.connect(DB)
+    try:
+        return pd.read_sql_query("SELECT * FROM writeoffs ORDER BY writeoff_date DESC", con)
+    finally:
+        con.close()
+
+
+def analyze(products, sales, deliveries):
     results = []
+
+    # Process pending / recent deliveries to subtract in-transit items from suggested order
+    incoming_map = {}
+    if not deliveries.empty:
+        deliveries_df = deliveries.copy()
+        deliveries_df["delivery_date"] = pd.to_datetime(deliveries_df["delivery_date"])
+        cutoff_date = pd.Timestamp.today() - pd.Timedelta(days=7)
+        recent_delivs = deliveries_df[deliveries_df["delivery_date"] >= cutoff_date]
+        incoming_map = recent_delivs.groupby("sku")["quantity"].sum().to_dict()
 
     for _, p in products.iterrows():
         history = sales[sales.sku == p.sku].copy()
@@ -176,10 +216,18 @@ def analyze(products, sales):
                 .asfreq("D", fill_value=0)
             )
 
-        recent = daily.tail(28)
-        previous = daily.tail(56).head(28)
+        total_days = len(daily)
+        if total_days >= 56:
+            recent = daily.iloc[-28:]
+            previous = daily.iloc[-56:-28]
+        elif total_days >= 28:
+            recent = daily.tail(28)
+            previous = daily.head(total_days - 28)
+        else:
+            recent = daily
+            previous = pd.Series([0.0])
 
-        if len(previous) > 0:
+        if len(previous) > 0 and previous.mean() > 0:
             avg_day = 0.65 * recent.mean() + 0.35 * previous.mean()
         else:
             avg_day = recent.mean()
@@ -192,11 +240,16 @@ def analyze(products, sales):
         safety = int(np.ceil(1.65 * variation * np.sqrt(lead)))
         reorder_point = int(np.ceil(avg_day * lead + safety))
         forecast30 = int(np.ceil(avg_day * 30))
-        order_qty = max(0, forecast30 + safety - int(p.stock))
+
+        # Include pending/in-transit deliveries into stock accounting
+        pending_stock = incoming_map.get(p.sku, 0)
+        effective_stock = int(p.stock) + pending_stock
+
+        order_qty = max(0, forecast30 + safety - effective_stock)
 
         days_expiry = (
-            (date.fromisoformat(p.expiry) - date.today()).days
-            if p.expiry else None
+            (date.fromisoformat(str(p.expiry)) - date.today()).days
+            if pd.notna(p.expiry) and str(p.expiry).strip() != "" else None
         )
 
         if p.stock <= reorder_point:
@@ -211,6 +264,7 @@ def analyze(products, sales):
             "Product": p["name"],
             "Supplier": p.supplier,
             "Stock": int(p.stock),
+            "Pending Supply": pending_stock,
             "Daily Demand": round(avg_day, 2),
             "Forecast 7 Days": int(np.ceil(avg_day * 7)),
             "Forecast 30 Days": forecast30,
@@ -220,12 +274,33 @@ def analyze(products, sales):
             "Suggested Order": order_qty,
             "Unit Cost": float(p.unit_cost),
             "Inventory Value": int(p.stock) * float(p.unit_cost),
+            "Annual Consumption Value": round(avg_day * 365 * float(p.unit_cost), 2),
             "Expiry": p.expiry,
             "Days to Expiry": days_expiry,
             "Status": status
         })
 
-    return pd.DataFrame(results)
+    res_df = pd.DataFrame(results)
+
+    # Compute ABC Inventory Classification based on Annual Consumption Value
+    if not res_df.empty and res_df["Annual Consumption Value"].sum() > 0:
+        res_df = res_df.sort_values(by="Annual Consumption Value", ascending=False)
+        total_val = res_df["Annual Consumption Value"].sum()
+        res_df["Cumulative Value %"] = (res_df["Annual Consumption Value"].cumsum() / total_val) * 100
+
+        def assign_abc(row):
+            if row["Cumulative Value %"] <= 70:
+                return "Class A (Critical)"
+            elif row["Cumulative Value %"] <= 90:
+                return "Class B (Moderate)"
+            return "Class C (Routine)"
+
+        res_df["ABC Class"] = res_df.apply(assign_abc, axis=1)
+        res_df = res_df.drop(columns=["Cumulative Value %"])
+    else:
+        res_df["ABC Class"] = "Class C (Routine)"
+
+    return res_df
 
 
 st.markdown("""
@@ -264,14 +339,15 @@ st.caption("Student project only. Not affiliated with or connected to the actual
 
 products = read_products()
 sales = read_sales()
-report = analyze(products, sales)
+deliveries = read_deliveries()
+report = analyze(products, sales, deliveries)
 
-# FIX: Removed "Products" from navigation since it's inside Inventory Forecast
 page = st.sidebar.radio("Navigation", [
     "Dashboard",
     "Inventory Forecast",
     "Record Sale",
     "Receive Delivery",
+    "Write-Off Stock",
     "Sales Analysis",
     "Export Reports"
 ])
@@ -369,9 +445,28 @@ if page == "Dashboard":
 
 elif page == "Inventory Forecast":
     st.subheader("Predictive inventory recommendations")
-    st.write("Forecasts are estimates based on historical daily sales. They are not guaranteed predictions.")
+    st.write("Forecasts are estimates based on historical daily sales and account for safety stock and recent deliveries.")
 
     st.dataframe(report, use_container_width=True, hide_index=True)
+
+    st.markdown("### 📊 ABC Inventory Analysis")
+    st.caption("Pareto classification: Class A = Top 70% value (critical), Class B = Next 20% (moderate), Class C = Bottom 10% (routine)")
+
+    abc_summary = report.groupby("ABC Class").agg(
+        Items=("SKU", "count"),
+        Total_Value=("Inventory Value", "sum"),
+        Annual_Consumption=("Annual Consumption Value", "sum")
+    ).reset_index()
+
+    col_abc1, col_abc2 = st.columns([1, 1])
+    with col_abc1:
+        fig_abc = px.pie(abc_summary, names="ABC Class", values="Annual_Consumption",
+                         title="Annual Consumption Value by ABC Tier",
+                         color_discrete_sequence=["#c8102e", "#d97706", "#2563eb"])
+        st.plotly_chart(fig_abc, use_container_width=True)
+    with col_abc2:
+        st.markdown("#### Category Breakdown")
+        st.dataframe(abc_summary, use_container_width=True, hide_index=True)
 
     st.markdown("### Why is this product recommended?")
 
@@ -383,12 +478,13 @@ elif page == "Inventory Forecast":
 
     item = report.loc[report["SKU"] == selected_sku].iloc[0]
 
-    st.markdown(f"#### {item['Product']}")
+    st.markdown(f"#### {item['Product']} ({item['ABC Class']})")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Current stock", int(item["Stock"]))
-    col2.metric("Reorder point", int(item["Reorder Point"]))
-    col3.metric("Suggested order", int(item["Suggested Order"]))
+    col2.metric("Pending delivery", int(item["Pending Supply"]))
+    col3.metric("Reorder point", int(item["Reorder Point"]))
+    col4.metric("Suggested order", int(item["Suggested Order"]))
 
     st.write(f"Estimated daily demand: {item['Daily Demand']:.2f} units")
     st.write(f"Estimated demand for the next 30 days: {item['Forecast 30 Days']} units")
@@ -459,7 +555,7 @@ elif page == "Inventory Forecast":
         stock_filter = st.selectbox("Filter by stock status", ["All products", "Needs reorder", "Above reorder point"])
 
     product_view = products.merge(
-        report[["SKU", "Reorder Point", "Status"]],
+        report[["SKU", "Reorder Point", "Status", "ABC Class"]],
         left_on="sku",
         right_on="SKU",
         how="left"
@@ -485,7 +581,7 @@ elif page == "Inventory Forecast":
     st.dataframe(
         product_view[[
             "sku", "name", "category", "supplier", "stock",
-            "unit_cost", "lead_days", "expiry", "Reorder Point", "Status"
+            "unit_cost", "lead_days", "expiry", "Reorder Point", "ABC Class", "Status"
         ]],
         use_container_width=True,
         hide_index=True
@@ -550,6 +646,45 @@ elif page == "Receive Delivery":
             st.success("Delivery recorded and inventory updated.")
             st.rerun()
 
+elif page == "Write-Off Stock":
+    st.subheader("Disposal & Write-Off (Expired/Damaged Stock)")
+    st.write("Record items removed from inventory due to expiration, damage, or spoilage.")
+
+    names = dict(zip(products.sku, products["name"]))
+
+    with st.form("writeoff_form"):
+        sku = st.selectbox("Product", products.sku.tolist(), format_func=lambda x: f"{x} — {names[x]}")
+        quantity = st.number_input("Quantity to write off", min_value=1, step=1)
+        reason = st.selectbox("Reason for disposal", ["Expired", "Damaged / Broken", "Contaminated", "Other"])
+        writeoff_date = st.date_input("Disposal date", value=date.today())
+        submit_writeoff = st.form_submit_button("Confirm Write-Off")
+
+        if submit_writeoff:
+            with get_db() as con:
+                row = con.execute("SELECT stock FROM products WHERE sku=?", (sku,)).fetchone()
+                if row and quantity > row[0]:
+                    st.error(f"Cannot write off more than current stock ({row[0]}).")
+                else:
+                    con.execute(
+                        "UPDATE products SET stock = stock - ? WHERE sku = ?",
+                        (int(quantity), sku)
+                    )
+                    con.execute("""
+                    INSERT INTO writeoffs (writeoff_date, sku, quantity, reason)
+                    VALUES (?, ?, ?, ?)
+                    """, (writeoff_date.isoformat(), sku, int(quantity), reason))
+
+                    st.cache_data.clear()
+                    st.success(f"Successfully wrote off {quantity} units of {names[sku]}.")
+                    st.rerun()
+
+    st.markdown("### Write-Off Log History")
+    writeoff_df = read_writeoffs()
+    if writeoff_df.empty:
+        st.info("No stock write-offs recorded yet.")
+    else:
+        st.dataframe(writeoff_df, use_container_width=True, hide_index=True)
+
 elif page == "Sales Analysis":
     st.subheader("Sales Performance Analytics")
     st.caption("Analyze recorded unit sales and product demand. Demonstration data is synthetic.")
@@ -598,8 +733,24 @@ elif page == "Sales Analysis":
         fig_products.update_layout(yaxis_title="", xaxis_title="Total Units Sold", margin=dict(t=55, b=20, l=20, r=20))
         st.plotly_chart(fig_products, use_container_width=True)
 
-        st.info(
-            f"Highest-selling product in the recorded dataset: {best_product}. This ranking is based on unit quantities, not revenue or profit.")
+        st.markdown("### 📦 Supplier Portfolio Allocation")
+        supplier_summary = report.groupby("Supplier").agg(
+            Total_Products=("SKU", "count"),
+            Capital_Invested=("Inventory Value", "sum"),
+            Reorder_Alerts=("Status", lambda x: (x == "REORDER").sum())
+        ).reset_index()
+
+        col_sup1, col_sup2 = st.columns(2)
+        with col_sup1:
+            fig_supplier = px.bar(
+                supplier_summary, x="Supplier", y="Capital_Invested",
+                title="Capital Investment per Supplier (PHP)",
+                color_discrete_sequence=["#c8102e"]
+            )
+            st.plotly_chart(fig_supplier, use_container_width=True)
+        with col_sup2:
+            st.markdown("#### Supplier Details")
+            st.dataframe(supplier_summary, use_container_width=True, hide_index=True)
 
         with st.expander("View detailed product sales"):
             st.dataframe(
@@ -612,9 +763,9 @@ elif page == "Export Reports":
     st.subheader("Download reports")
 
     st.download_button(
-        "Download inventory forecast CSV",
+        "Download inventory forecast & ABC analysis CSV",
         report.to_csv(index=False).encode("utf-8"),
-        "inventory_forecast.csv",
+        "inventory_forecast_abc.csv",
         "text/csv"
     )
 
@@ -625,15 +776,17 @@ elif page == "Export Reports":
         "text/csv"
     )
 
-    con = sqlite3.connect(DB)
-    try:
-        deliveries = pd.read_sql_query("SELECT * FROM deliveries ORDER BY delivery_date DESC", con)
-    finally:
-        con.close()
-
     st.download_button(
         "Download delivery history CSV",
         deliveries.to_csv(index=False).encode("utf-8"),
         "delivery_history.csv",
+        "text/csv"
+    )
+
+    writeoffs_df = read_writeoffs()
+    st.download_button(
+        "Download write-off history CSV",
+        writeoffs_df.to_csv(index=False).encode("utf-8"),
+        "writeoff_history.csv",
         "text/csv"
     )
